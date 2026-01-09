@@ -2,7 +2,6 @@ package com.example.trackcal
 
 import android.content.Context
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -23,27 +22,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.room.*
 import com.example.trackcal.ui.theme.TrackCalTheme
+import com.google.ai.client.generativeai.GenerativeModel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.util.*
-
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import com.example.trackcal.BuildConfig
-
 
 // --- 1. DATA LAYER (ROOM) ---
 
@@ -60,10 +51,8 @@ data class Food(
 interface FoodDao {
     @Query("SELECT * FROM food_table ORDER BY date DESC")
     fun getAllFoods(): Flow<List<Food>>
-
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(food: Food)
-
     @Delete
     suspend fun delete(food: Food)
 }
@@ -85,13 +74,18 @@ abstract class AppDatabase : RoomDatabase() {
 
 // --- 2. STORAGE HELPERS ---
 
-fun saveGoals(context: Context, cal: Int, prot: Int) {
+fun saveUserSettings(context: Context, cal: Int, prot: Int, apiKey: String) {
     val prefs = context.getSharedPreferences("user_prefs", Context.MODE_PRIVATE)
-    prefs.edit().putInt("cal_goal", cal).putInt("prot_goal", prot).apply()
+    prefs.edit()
+        .putInt("cal_goal", cal)
+        .putInt("prot_goal", prot)
+        .putString("gemini_api_key", apiKey)
+        .apply()
 }
 
 fun getSavedCalGoal(context: Context): Int = context.getSharedPreferences("user_prefs", Context.MODE_PRIVATE).getInt("cal_goal", 2000)
 fun getSavedProtGoal(context: Context): Int = context.getSharedPreferences("user_prefs", Context.MODE_PRIVATE).getInt("prot_goal", 150)
+fun getSavedApiKey(context: Context): String = context.getSharedPreferences("user_prefs", Context.MODE_PRIVATE).getString("gemini_api_key", "") ?: ""
 
 // --- 3. UI COMPONENTS ---
 
@@ -118,8 +112,8 @@ fun HomeScreen() {
 
     var calGoal by remember { mutableStateOf(getSavedCalGoal(context)) }
     var protGoal by remember { mutableStateOf(getSavedProtGoal(context)) }
+    var apiKey by remember { mutableStateOf(getSavedApiKey(context)) }
 
-    // Filter today's foods for the dashboard list
     val todayStart = remember(allFoods) {
         Calendar.getInstance().apply {
             set(Calendar.HOUR_OF_DAY, 0)
@@ -142,7 +136,10 @@ fun HomeScreen() {
         },
         floatingActionButton = {
             if (!showAddFood) {
-                FloatingActionButton(onClick = { showAddFood = true }, containerColor = MaterialTheme.colorScheme.primary) {
+                FloatingActionButton(onClick = { 
+                    if (apiKey.isBlank()) showSettings = true 
+                    else showAddFood = true 
+                }, containerColor = MaterialTheme.colorScheme.primary) {
                     Text("+", fontSize = 24.sp, color = Color.White)
                 }
             }
@@ -150,16 +147,18 @@ fun HomeScreen() {
     ) { padding ->
         Column(modifier = Modifier.padding(padding)) {
             AnimatedVisibility(visible = showSettings) {
-                GoalSettingsCard(calGoal, protGoal) { c, p ->
+                GoalSettingsCard(calGoal, protGoal, apiKey) { c, p, key ->
                     calGoal = c
                     protGoal = p
-                    saveGoals(context, c, p)
+                    apiKey = key
+                    saveUserSettings(context, c, p, key)
                     showSettings = false
                 }
             }
 
             if (showAddFood) {
                 AddFoodScreen(
+                    apiKey = apiKey,
                     onFoodAdded = { food ->
                         if (food.name.startsWith("Error")) {
                             scope.launch { snackbarHostState.showSnackbar(food.name) }
@@ -184,14 +183,11 @@ fun MainDashboard(todayFoods: List<Food>, allHistory: List<Food>, calGoal: Int, 
 
     Column(modifier = Modifier.padding(16.dp)) {
         DailyProgress(totalCal, calGoal, totalProt, protGoal)
-
         Spacer(modifier = Modifier.height(24.dp))
         Text("Weekly Consistency", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         BetterHeatmap(allHistory, calGoal, protGoal)
-
         Spacer(modifier = Modifier.height(24.dp))
         Text("Today's Logs", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 80.dp)) {
             items(items = todayFoods, key = { it.id }) { food ->
                 SwipeToDeleteContainer(item = food, onDelete = onDelete) { FoodItemCard(it) }
@@ -220,17 +216,14 @@ fun BetterHeatmap(foods: List<Food>, calGoal: Int, protGoal: Int) {
             val daysFood = foods.filter { it.date in dayStart until dayEnd }
             val dCal = daysFood.sumOf { it.calories }
             val dProt = daysFood.sumOf { it.protein }
-
             val metBoth = dCal >= (calGoal * 0.9) && dProt >= (protGoal * 0.9)
             val metOne = dCal >= (calGoal * 0.9) || dProt >= (protGoal * 0.9)
-
             val color = when {
                 daysFood.isEmpty() -> MaterialTheme.colorScheme.surfaceVariant
                 metBoth -> Color(0xFF2E7D32)
                 metOne -> Color(0xFF81C784)
                 else -> Color(0xFFFFB74D)
             }
-
             Box(Modifier.size(34.dp).background(color, RoundedCornerShape(8.dp)))
         }
     }
@@ -238,12 +231,7 @@ fun BetterHeatmap(foods: List<Food>, calGoal: Int, protGoal: Int) {
 
 @Composable
 fun FoodItemCard(food: Food) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(2.dp)
-    ) {
+    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), elevation = CardDefaults.cardElevation(2.dp)) {
         Row(Modifier.padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(food.name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
@@ -257,53 +245,46 @@ fun FoodItemCard(food: Food) {
 }
 
 @Composable
-fun AddFoodScreen(onFoodAdded: (Food) -> Unit, onClose: () -> Unit) {
+fun AddFoodScreen(apiKey: String, onFoodAdded: (Food) -> Unit, onClose: () -> Unit) {
     var desc by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     Column(Modifier.fillMaxSize().padding(24.dp)) {
         Text("Analyze Meal", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-        Text("What did you eat?", style = MaterialTheme.typography.bodyMedium, color = Color.Gray, modifier = Modifier.padding(bottom = 16.dp))
-
-        OutlinedTextField(
-            value = desc,
-            onValueChange = { desc = it },
-            modifier = Modifier.fillMaxWidth().height(150.dp),
-            shape = RoundedCornerShape(16.dp),
-            placeholder = { Text("E.g. 3 eggs and a piece of toast") }
-        )
-
+        Text("Describe what you ate", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+        OutlinedTextField(value = desc, onValueChange = { desc = it }, modifier = Modifier.fillMaxWidth().height(150.dp).padding(vertical = 16.dp), shape = RoundedCornerShape(16.dp), placeholder = { Text("E.g. Double cheeseburger and fries") })
         Spacer(Modifier.weight(1f))
-
         if (loading) CircularProgressIndicator(Modifier.align(Alignment.CenterHorizontally))
         else {
             Button(onClick = {
                 if (desc.isNotBlank()) {
                     loading = true
-                    scope.launch { onFoodAdded(fetchNutrientsFromAI(desc)); loading = false }
+                    scope.launch { onFoodAdded(fetchNutrientsFromAI(desc, apiKey)); loading = false }
                 }
-            }, modifier = Modifier.fillMaxWidth().height(56.dp), shape = RoundedCornerShape(16.dp)) {
-                Text("Analyze & Add")
-            }
+            }, modifier = Modifier.fillMaxWidth().height(56.dp), shape = RoundedCornerShape(16.dp)) { Text("Analyze & Add") }
             TextButton(onClick = onClose, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }
         }
     }
 }
 
 @Composable
-fun GoalSettingsCard(cGoal: Int, pGoal: Int, onSave: (Int, Int) -> Unit) {
-    var cInput by remember(cGoal) { mutableStateOf(cGoal.toString()) }
-    var pInput by remember(pGoal) { mutableStateOf(pGoal.toString()) }
+fun GoalSettingsCard(cGoal: Int, pGoal: Int, currentKey: String, onSave: (Int, Int, String) -> Unit) {
+    var cInput by remember { mutableStateOf(cGoal.toString()) }
+    var pInput by remember { mutableStateOf(pGoal.toString()) }
+    var apiInput by remember { mutableStateOf(currentKey) }
+    val uriHandler = LocalUriHandler.current
 
     Card(modifier = Modifier.padding(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
         Column(Modifier.padding(16.dp)) {
-            Text("Set Daily Target", fontWeight = FontWeight.Bold)
+            Text("Settings", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(value = apiInput, onValueChange = { apiInput = it }, label = { Text("Gemini API Key") }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), visualTransformation = PasswordVisualTransformation())
+            TextButton(onClick = { uriHandler.openUri("https://aistudio.google.com/app/apikey") }) { Text("Get free API key here", fontSize = 12.sp) }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(value = cInput, onValueChange = { cInput = it }, label = { Text("Cals") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
                 OutlinedTextField(value = pInput, onValueChange = { pInput = it }, label = { Text("Prot (g)") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
             }
-            Button(onClick = { onSave(cInput.toIntOrNull() ?: cGoal, pInput.toIntOrNull() ?: pGoal) }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Update Goals") }
+            Button(onClick = { onSave(cInput.toIntOrNull() ?: cGoal, pInput.toIntOrNull() ?: pGoal, apiInput) }, modifier = Modifier.fillMaxWidth().padding(top = 16.dp)) { Text("Save Settings") }
         }
     }
 }
@@ -311,27 +292,18 @@ fun GoalSettingsCard(cGoal: Int, pGoal: Int, onSave: (Int, Int) -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun <T> SwipeToDeleteContainer(item: T, onDelete: (T) -> Unit, content: @Composable (T) -> Unit) {
-    val state = rememberSwipeToDismissBoxState(confirmValueChange = {
-        if (it == SwipeToDismissBoxValue.EndToStart) { onDelete(item); true } else false
-    })
-    SwipeToDismissBox(
-        state = state,
-        enableDismissFromStartToEnd = false,
-        backgroundContent = {
-            val color = if (state.dismissDirection == SwipeToDismissBoxValue.EndToStart) Color.Red.copy(alpha = 0.6f) else Color.Transparent
-            Box(Modifier.fillMaxSize().background(color, RoundedCornerShape(12.dp)).padding(horizontal = 20.dp), contentAlignment = Alignment.CenterEnd) {
-                Icon(Icons.Default.Delete, contentDescription = null, tint = Color.White)
-            }
-        },
-        content = { content(item) }
-    )
+    val state = rememberSwipeToDismissBoxState(confirmValueChange = { if (it == SwipeToDismissBoxValue.EndToStart) { onDelete(item); true } else false })
+    SwipeToDismissBox(state = state, enableDismissFromStartToEnd = false, backgroundContent = {
+        val color = if (state.dismissDirection == SwipeToDismissBoxValue.EndToStart) Color.Red.copy(alpha = 0.6f) else Color.Transparent
+        Box(Modifier.fillMaxSize().background(color, RoundedCornerShape(12.dp)).padding(horizontal = 20.dp), contentAlignment = Alignment.CenterEnd) { Icon(Icons.Default.Delete, contentDescription = null, tint = Color.White) }
+    }, content = { content(item) })
 }
 
 @Composable
 fun DailyProgress(current: Int, goal: Int, protein: Int, pGoal: Int) {
     Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
         Column(modifier = Modifier.padding(20.dp)) {
-            Text("Calories Left", style = MaterialTheme.typography.labelLarge)
+            Text("Calories Remaining", style = MaterialTheme.typography.labelLarge)
             Text("${(goal - current).coerceAtLeast(0)} kcal", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(12.dp))
             LinearProgressIndicator(progress = { (current.toFloat() / goal).coerceAtMost(1f) }, modifier = Modifier.fillMaxWidth().height(8.dp), strokeCap = androidx.compose.ui.graphics.StrokeCap.Round)
@@ -341,54 +313,15 @@ fun DailyProgress(current: Int, goal: Int, protein: Int, pGoal: Int) {
     }
 }
 
-
-suspend fun fetchNutrientsFromAI(input: String): Food = withContext(Dispatchers.IO) {
-    val client = OkHttpClient()
-    val apiKey = BuildConfig.API_KEY
-    val modelId = "xiaomi/mimo-v2-flash:free"
-
-    // OpenRouter uses the OpenAI-compatible "messages" format
-    val jsonRequest = JSONObject().apply {
-        put("model", modelId)
-        put("messages", org.json.JSONArray().apply {
-            put(JSONObject().apply {
-                put("role", "user")
-                put("content", "Analyze food: '$input'. Return ONLY JSON: {\"food_name\": \"string\", \"calories\": int, \"protein\": int}")
-            })
-        })
-    }
-
-    val request = Request.Builder()
-        .url("https://openrouter.ai/api/v1/chat/completions")
-        .addHeader("Authorization", "Bearer $apiKey")
-        .addHeader("Content-Type", "application/json")
-        // Optional headers for OpenRouter rankings
-        .addHeader("HTTP-Referer", "https://your-app-name.com")
-        .post(jsonRequest.toString().toRequestBody("application/json".toMediaType()))
-        .build()
-
-    return@withContext try {
-        val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: ""
-
-        if (!response.isSuccessful) throw Exception("API Error: ${response.code}")
-
-        // OpenRouter returns: { "choices": [{ "message": { "content": "..." } }] }
-        val root = JSONObject(body)
-        val aiContent = root.getJSONArray("choices")
-            .getJSONObject(0)
-            .getJSONObject("message")
-            .getString("content")
-
-        val cleanJson = aiContent.trim().removeSurrounding("```json", "```").trim()
-        val foodJson = JSONObject(cleanJson)
-
-        Food(
-            name = foodJson.getString("food_name"),
-            calories = foodJson.getInt("calories"),
-            protein = foodJson.getInt("protein")
-        )
+suspend fun fetchNutrientsFromAI(input: String, apiKey: String): Food {
+    val model = GenerativeModel(modelName = "gemini-2.5-flash", apiKey = apiKey)
+    val prompt = "Analyze food: '$input'. Return ONLY JSON: {\"food_name\": \"string\", \"calories\": int, \"protein\": int}"
+    return try {
+        val response = model.generateContent(prompt).text ?: ""
+        val cleanJson = response.trim().removeSurrounding("```json", "```").trim()
+        val json = JSONObject(cleanJson)
+        Food(name = json.getString("food_name"), calories = json.getInt("calories"), protein = json.getInt("protein"))
     } catch (e: Exception) {
-        Food(name = "Error: ${e.localizedMessage}", calories = 0, protein = 0)
+        Food(name = "Error: AI failed or key invalid", calories = 0, protein = 0)
     }
 }
